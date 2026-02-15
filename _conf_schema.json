@@ -1,0 +1,48 @@
+{
+    "cdn_source": {
+        "type": "string",
+        "description": "Emoji 图片 CDN 来源",
+        "hint": "选择内置 CDN 地址，或选择「自定义」后在下方填写",
+        "options": ["www.gstatic.cn（国内推荐）", "www.gstatic.com（国际）", "自定义"],
+        "default": ""
+    },
+    "cdn_url": {
+        "type": "string",
+        "description": "自定义 CDN 地址",
+        "hint": "仅在上方选择「自定义」时生效，需包含协议（如 https://example.com）",
+        "default": ""
+    },
+    "github_proxy_source": {
+        "type": "string",
+        "description": "GitHub 代理来源",
+        "hint": "用于拉取日期列表。选择内置代理，或选择「自定义」后在下方填写。选择「不使用代理」则直连 GitHub",
+        "options": ["ghfast.top", "gh-proxy.com", "自定义", "不使用代理"],
+        "default": ""
+    },
+    "github_proxy": {
+        "type": "string",
+        "description": "自定义 GitHub 代理地址",
+        "hint": "仅在上方选择「自定义」时生效，需包含协议（如 https://your-proxy.com）",
+        "default": ""
+    },
+    "extra_dates": {
+        "type": "text",
+        "description": "用户手动追加的日期，每行一个（格式如 20251029）",
+        "default": ""
+    },
+    "notfound_expire_days": {
+        "type": "int",
+        "description": "不存在标记过期天数",
+        "default": 7
+    },
+    "request_timeout": {
+        "type": "int",
+        "description": "单次 HTTP 请求超时（秒）",
+        "default": 10
+    },
+    "max_probe_dates": {
+        "type": "int",
+        "description": "每次请求最多探测的日期数",
+        "default": 10
+    }
+}
