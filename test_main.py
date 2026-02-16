@@ -160,7 +160,6 @@ class TestCacheManagement:
             # 直接构造，绕过 AstrBot 框架
             from main import EmojiKitchenPlugin
             ctx = MagicMock()
-            ctx.get_data_dir.return_value = str(tmp_path)
             plugin = EmojiKitchenPlugin.__new__(EmojiKitchenPlugin)
             plugin.context = ctx
             plugin.config = {"notfound_expire_days": 7}
@@ -169,6 +168,8 @@ class TestCacheManagement:
             plugin.notfound_dir = tmp_path / "notfound"
             plugin.dates_cache_path = tmp_path / "dates_cache.json"
             plugin.date_list = list(HARDCODED_DATES)
+            plugin.metadata_dir = tmp_path / "metadata"
+            plugin.metadata_index = {}
             plugin._locks = OrderedDict()
             plugin._global_lock = asyncio.Lock()
             plugin._session = None
@@ -177,6 +178,7 @@ class TestCacheManagement:
             plugin._update_task = None
             plugin.cache_dir.mkdir(parents=True, exist_ok=True)
             plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+            plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
             return plugin
 
     def test_get_cached_image_exists(self, plugin):
@@ -265,6 +267,8 @@ class TestDateList:
             plugin.notfound_dir = tmp_path / "notfound"
             plugin.dates_cache_path = tmp_path / "dates_cache.json"
             plugin.date_list = []
+            plugin.metadata_dir = tmp_path / "metadata"
+            plugin.metadata_index = {}
             plugin._locks = OrderedDict()
             plugin._global_lock = asyncio.Lock()
             plugin._session = None
@@ -273,6 +277,7 @@ class TestDateList:
             plugin._update_task = None
             plugin.cache_dir.mkdir(parents=True, exist_ok=True)
             plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+            plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
             return plugin
 
     def test_load_date_list_hardcoded_only(self, plugin):
@@ -355,6 +360,178 @@ class TestBuildUrls:
         urls = plugin._build_urls("2764-fe0f", "1f600", "20251029")
         assert "u2764-ufe0f" in urls[0]
         assert "u1f600" in urls[0]
+
+
+class TestMetadataIndex:
+    """测试元数据索引功能"""
+
+    @pytest.fixture
+    def plugin(self, tmp_path):
+        from main import EmojiKitchenPlugin
+        plugin = EmojiKitchenPlugin.__new__(EmojiKitchenPlugin)
+        plugin.config = {}
+        plugin.data_dir = tmp_path
+        plugin.cache_dir = tmp_path / "cache"
+        plugin.notfound_dir = tmp_path / "notfound"
+        plugin.metadata_dir = tmp_path / "metadata"
+        plugin.dates_cache_path = tmp_path / "dates_cache.json"
+        from main import HARDCODED_DATES
+        plugin.date_list = list(HARDCODED_DATES)
+        plugin.metadata_index = {}
+        plugin._locks = OrderedDict()
+        plugin._global_lock = asyncio.Lock()
+        plugin._session = None
+        plugin._session_lock = asyncio.Lock()
+        plugin._semaphore = asyncio.Semaphore(4)
+        plugin._update_task = None
+        plugin.cache_dir.mkdir(parents=True, exist_ok=True)
+        plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+        plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
+        return plugin
+
+    def test_lookup_date_hit(self, plugin):
+        """索引命中：双向查找"""
+        plugin.metadata_index = {
+            "1f437": {"1f437": "20230216", "1f600": "20201001"}
+        }
+        # 正向命中
+        assert plugin._lookup_date("1f437", "1f600") == "20201001"
+        # 反向命中
+        assert plugin._lookup_date("1f600", "1f437") == "20201001"
+
+    def test_lookup_date_miss(self, plugin):
+        """索引未命中"""
+        plugin.metadata_index = {
+            "1f437": {"1f437": "20230216"}
+        }
+        assert plugin._lookup_date("1f437", "1f600") is None
+        assert plugin._lookup_date("1f600", "1f60d") is None
+
+    def test_lookup_date_empty_index(self, plugin):
+        """空索引"""
+        assert plugin._lookup_date("1f437", "1f600") is None
+
+    def test_load_metadata_index(self, plugin):
+        """从本地文件加载索引"""
+        # 写入一个元数据文件
+        metadata = {
+            "combinations": {
+                "1f600": [
+                    {"gStaticUrl": "...", "date": "20201001", "isLatest": True}
+                ],
+                "1f60d": [
+                    {"gStaticUrl": "...", "date": "20230216", "isLatest": False},
+                    {"gStaticUrl": "...", "date": "20201001", "isLatest": True}
+                ]
+            }
+        }
+        (plugin.metadata_dir / "1f437.json").write_text(json.dumps(metadata))
+        plugin._load_metadata_index()
+
+        assert "1f437" in plugin.metadata_index
+        assert plugin.metadata_index["1f437"]["1f600"] == "20201001"
+        # isLatest=True 的应该被选中
+        assert plugin.metadata_index["1f437"]["1f60d"] == "20201001"
+
+    def test_load_metadata_index_no_is_latest(self, plugin):
+        """没有 isLatest 字段时取第一条"""
+        metadata = {
+            "combinations": {
+                "1f600": [
+                    {"gStaticUrl": "...", "date": "20230216"},
+                    {"gStaticUrl": "...", "date": "20201001"}
+                ]
+            }
+        }
+        (plugin.metadata_dir / "1f437.json").write_text(json.dumps(metadata))
+        plugin._load_metadata_index()
+        assert plugin.metadata_index["1f437"]["1f600"] == "20230216"
+
+    def test_load_metadata_index_corrupted_file(self, plugin):
+        """损坏的 JSON 文件被跳过"""
+        (plugin.metadata_dir / "bad.json").write_text("not json")
+        (plugin.metadata_dir / "1f437.json").write_text(json.dumps({
+            "combinations": {"1f600": [{"date": "20201001", "isLatest": True}]}
+        }))
+        plugin._load_metadata_index()
+        # bad.json 被跳过，1f437 正常加载
+        assert "1f437" in plugin.metadata_index
+        assert "bad" not in plugin.metadata_index
+
+    def test_load_metadata_index_empty_dir(self, plugin):
+        """空目录"""
+        plugin._load_metadata_index()
+        assert plugin.metadata_index == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_and_cache_metadata(self, plugin):
+        """远程拉取并缓存元数据"""
+        remote_data = {
+            "combinations": {
+                "1f600": [
+                    {"gStaticUrl": "...", "date": "20201001", "isLatest": True}
+                ]
+            }
+        }
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=remote_data)
+
+        mock_session = AsyncMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(return_value=AsyncContextManager(mock_resp))
+        plugin._session = mock_session
+
+        await plugin._fetch_and_cache_metadata("1f437")
+
+        # 验证文件缓存
+        assert (plugin.metadata_dir / "1f437.json").exists()
+        # 验证内存索引更新
+        assert "1f437" in plugin.metadata_index
+        assert plugin.metadata_index["1f437"]["1f600"] == "20201001"
+
+    @pytest.mark.asyncio
+    async def test_fetch_and_cache_metadata_failure(self, plugin):
+        """远程拉取失败不影响已有索引"""
+        plugin.metadata_index = {"existing": {"key": "value"}}
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 404
+
+        mock_session = AsyncMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(return_value=AsyncContextManager(mock_resp))
+        plugin._session = mock_session
+
+        await plugin._fetch_and_cache_metadata("nonexistent")
+
+        # 已有索引不受影响
+        assert plugin.metadata_index == {"existing": {"key": "value"}}
+
+    @pytest.mark.asyncio
+    async def test_fetch_and_cache_metadata_merges_dates(self, plugin):
+        """拉取元数据时新日期被合并到 date_list"""
+        plugin.date_list = ["20251029"]
+        remote_data = {
+            "combinations": {
+                "1f600": [
+                    {"gStaticUrl": "...", "date": "20190101", "isLatest": True}
+                ]
+            }
+        }
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=remote_data)
+
+        mock_session = AsyncMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(return_value=AsyncContextManager(mock_resp))
+        plugin._session = mock_session
+
+        await plugin._fetch_and_cache_metadata("1f437")
+
+        assert "20190101" in plugin.date_list
+        assert "20251029" in plugin.date_list
 
 
 class TestTryFetchUrl:
@@ -457,6 +634,8 @@ class TestFetchEmojiImage:
         plugin.notfound_dir = tmp_path / "notfound"
         plugin.dates_cache_path = tmp_path / "dates_cache.json"
         plugin.date_list = ["20251029", "20250501"]
+        plugin.metadata_dir = tmp_path / "metadata"
+        plugin.metadata_index = {}
         plugin._locks = OrderedDict()
         plugin._global_lock = asyncio.Lock()
         plugin._session = None
@@ -465,13 +644,15 @@ class TestFetchEmojiImage:
         plugin._update_task = None
         plugin.cache_dir.mkdir(parents=True, exist_ok=True)
         plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+        plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
         return plugin
 
     @pytest.mark.asyncio
     async def test_fetch_hit(self, plugin):
         """首个请求命中 → 返回缓存路径"""
         png_data = b"\x89PNG fake image"
-        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch:
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock):
             mock_fetch.return_value = png_data
             result = await plugin._fetch_emoji_image("1f600", "1f60d")
             assert result is not None
@@ -482,7 +663,8 @@ class TestFetchEmojiImage:
     async def test_fetch_all_404_full_probe(self, plugin):
         """全部 404 且探测全部日期 → 写入 notfound"""
         plugin.config["max_probe_dates"] = 10  # >= len(date_list)=2
-        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch:
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock):
             mock_fetch.return_value = None
             result = await plugin._fetch_emoji_image("1f600", "1f60d")
             assert result is None
@@ -494,7 +676,8 @@ class TestFetchEmojiImage:
     async def test_fetch_all_404_partial_probe(self, plugin):
         """全部 404 但 max_probe < 总日期数 → 不写 notfound"""
         plugin.config["max_probe_dates"] = 1  # < len(date_list)=2
-        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch:
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock):
             mock_fetch.return_value = None
             result = await plugin._fetch_emoji_image("1f600", "1f60d")
             assert result is None
@@ -505,7 +688,8 @@ class TestFetchEmojiImage:
     @pytest.mark.asyncio
     async def test_fetch_429_stops_and_no_notfound(self, plugin):
         """429 → 立即停止，不写 notfound"""
-        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch:
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock):
             mock_fetch.side_effect = RateLimitError()
             result = await plugin._fetch_emoji_image("1f600", "1f60d")
             assert result is None
@@ -516,13 +700,39 @@ class TestFetchEmojiImage:
     @pytest.mark.asyncio
     async def test_fetch_network_error_no_notfound(self, plugin):
         """网络错误 → 不写 notfound"""
-        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch:
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock):
             mock_fetch.side_effect = aiohttp.ClientError("timeout")
             result = await plugin._fetch_emoji_image("1f600", "1f60d")
             assert result is None
             from main import make_cache_key
             ck = make_cache_key("1f600", "1f60d")
             assert not (plugin.notfound_dir / f"{ck}.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_fetch_with_metadata_hit(self, plugin):
+        """元数据索引命中 → 精确日期直接返回，不走探测"""
+        png_data = b"\x89PNG fake image"
+        plugin.metadata_index = {
+            "1f600": {"1f60d": "20201001"}
+        }
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock) as mock_cache:
+            mock_fetch.return_value = png_data
+            result = await plugin._fetch_emoji_image("1f600", "1f60d")
+            assert result is not None
+            assert result.endswith(".png")
+            # _fetch_and_cache_metadata 不应被调用（索引已命中）
+            mock_cache.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_metadata_miss_fallback(self, plugin):
+        """元数据未命中 → 拉取后仍未命中 → 回退到探测"""
+        with patch.object(plugin, "_try_fetch_url", new_callable=AsyncMock) as mock_fetch, \
+             patch.object(plugin, "_fetch_and_cache_metadata", new_callable=AsyncMock):
+            mock_fetch.return_value = None  # 全部 404
+            result = await plugin._fetch_emoji_image("1f600", "1f60d")
+            assert result is None
 
 
 class TestOnMessage:
@@ -539,6 +749,8 @@ class TestOnMessage:
         plugin.notfound_dir = tmp_path / "notfound"
         plugin.dates_cache_path = tmp_path / "dates_cache.json"
         plugin.date_list = list(HARDCODED_DATES)
+        plugin.metadata_dir = tmp_path / "metadata"
+        plugin.metadata_index = {}
         plugin._locks = OrderedDict()
         plugin._global_lock = asyncio.Lock()
         plugin._session = None
@@ -547,6 +759,7 @@ class TestOnMessage:
         plugin._update_task = None
         plugin.cache_dir.mkdir(parents=True, exist_ok=True)
         plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+        plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
         return plugin
 
     def _make_event(self, message_str):
@@ -760,6 +973,8 @@ class TestOnMessageExceptionSafe:
         plugin.notfound_dir = tmp_path / "notfound"
         plugin.dates_cache_path = tmp_path / "dates_cache.json"
         plugin.date_list = list(HARDCODED_DATES)
+        plugin.metadata_dir = tmp_path / "metadata"
+        plugin.metadata_index = {}
         plugin._locks = OrderedDict()
         plugin._global_lock = asyncio.Lock()
         plugin._session = None
@@ -768,6 +983,7 @@ class TestOnMessageExceptionSafe:
         plugin._update_task = None
         plugin.cache_dir.mkdir(parents=True, exist_ok=True)
         plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+        plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
         return plugin
 
     @pytest.mark.asyncio
@@ -802,6 +1018,8 @@ class TestNotfoundCleanup:
         plugin.notfound_dir = tmp_path / "notfound"
         plugin.dates_cache_path = tmp_path / "dates_cache.json"
         plugin.date_list = list(HARDCODED_DATES)
+        plugin.metadata_dir = tmp_path / "metadata"
+        plugin.metadata_index = {}
         plugin._locks = OrderedDict()
         plugin._global_lock = asyncio.Lock()
         plugin._session = None
@@ -810,6 +1028,7 @@ class TestNotfoundCleanup:
         plugin._update_task = None
         plugin.cache_dir.mkdir(parents=True, exist_ok=True)
         plugin.notfound_dir.mkdir(parents=True, exist_ok=True)
+        plugin.metadata_dir.mkdir(parents=True, exist_ok=True)
         return plugin
 
     def test_is_notfound_expired_cleanup(self, plugin):

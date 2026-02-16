@@ -2,5 +2,5 @@ name: astrbot_plugin_emoji_kitchen
 display_name: Emoji Kitchen
 desc: 发送两个 emoji 自动合成 Google Emoji Kitchen 图片
 version: v1.0.0
-author: MR-MonkeyRay
+author: MonkeyRay
 repo: https://github.com/MR-MonkeyRay/astrbot_plugin_emoji_kitchen

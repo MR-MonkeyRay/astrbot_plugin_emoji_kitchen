@@ -10,7 +10,7 @@ import regex
 import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api import logger
 
 # ===== 常量 =====
@@ -76,15 +76,20 @@ class EmojiKitchenPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._semaphore: asyncio.Semaphore | None = None
         self._update_task: asyncio.Task | None = None
+        self.metadata_dir: Path = Path("")
+        self.metadata_index: dict[str, dict[str, str]] = {}  # {emoji_cp: {partner_cp: date}}
 
     async def initialize(self):
         """插件初始化：创建目录、加载配置、启动日期更新"""
-        self.data_dir = Path(self.context.get_data_dir())
+        self.data_dir = StarTools.get_data_dir()
         self.cache_dir = self.data_dir / "cache"
         self.notfound_dir = self.data_dir / "notfound"
         self.dates_cache_path = self.data_dir / "dates_cache.json"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.notfound_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_dir = self.data_dir / "metadata"
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        self._load_metadata_index()
         # 初始化 semaphore
         self._semaphore = asyncio.Semaphore(self._CONCURRENT_LIMIT)
         # 预创建 session
@@ -243,6 +248,112 @@ class EmojiKitchenPlugin(Star):
 
         self.date_list = sorted(dates, reverse=True)
 
+    def _load_metadata_index(self):
+        """从本地缓存的元数据 JSON 文件加载索引到内存"""
+        self.metadata_index.clear()
+        if not self.metadata_dir.exists():
+            return
+        for json_file in self.metadata_dir.glob("*.json"):
+            try:
+                cp = json_file.stem  # 文件名就是 emoji codepoint，如 "1f437"
+                with open(json_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                index_entry = {}
+                combinations = data.get("combinations", {})
+                for partner_cp, combo_list in combinations.items():
+                    if not isinstance(combo_list, list) or not combo_list:
+                        continue
+                    # 优先取 isLatest=true 的记录
+                    chosen = None
+                    for item in combo_list:
+                        if item.get("isLatest"):
+                            chosen = item
+                            break
+                    if chosen is None:
+                        chosen = combo_list[0]
+                    date = chosen.get("date", "")
+                    if date:
+                        index_entry[partner_cp] = date
+                if index_entry:
+                    self.metadata_index[cp] = index_entry
+            except (json.JSONDecodeError, OSError, TypeError, KeyError) as e:
+                logger.warning(f"加载元数据索引失败 {json_file.name}: {e}")
+
+    def _lookup_date(self, cp1: str, cp2: str) -> str | None:
+        """从元数据索引中查找组合对应的日期，双向查找"""
+        # 方向1: cp1 的元数据中查找 cp2
+        entry = self.metadata_index.get(cp1, {})
+        date = entry.get(cp2)
+        if date:
+            return date
+        # 方向2: cp2 的元数据中查找 cp1
+        entry = self.metadata_index.get(cp2, {})
+        date = entry.get(cp1)
+        if date:
+            return date
+        return None
+
+    async def _fetch_and_cache_metadata(self, cp: str):
+        """从 GitHub 拉取单个 emoji 的元数据 JSON 并缓存，更新内存索引"""
+        github_proxy = self._resolve_github_proxy()
+        timeout_sec = self._get_config("request_timeout", 10)
+        raw_url = f"https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/emoji/data/{cp}.json"
+        if github_proxy:
+            url = f"{github_proxy}/{raw_url}"
+        else:
+            url = raw_url
+
+        try:
+            session = await self._ensure_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+                if resp.status != 200:
+                    logger.debug(f"元数据拉取失败 {cp}: HTTP {resp.status}")
+                    return
+                data = await resp.json(content_type=None)
+
+            # 缓存到本地文件
+            cache_file = self.metadata_dir / f"{cp}.json"
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+            except OSError as e:
+                logger.warning(f"元数据缓存写入失败 {cp}: {e}")
+
+            # 更新内存索引
+            index_entry = {}
+            combinations = data.get("combinations", {}) if isinstance(data, dict) else {}
+            for partner_cp, combo_list in combinations.items():
+                if not isinstance(combo_list, list) or not combo_list:
+                    continue
+                chosen = None
+                for item in combo_list:
+                    if item.get("isLatest"):
+                        chosen = item
+                        break
+                if chosen is None:
+                    chosen = combo_list[0]
+                date = chosen.get("date", "")
+                if date:
+                    index_entry[partner_cp] = date
+            if index_entry:
+                self.metadata_index[cp] = index_entry
+
+            # 从元数据中提取日期合并到日期列表
+            new_dates = set()
+            for partner_cp, combo_list in combinations.items():
+                if not isinstance(combo_list, list):
+                    continue
+                for item in combo_list:
+                    d = item.get("date", "")
+                    if d and d not in self.date_list:
+                        new_dates.add(d)
+            if new_dates:
+                date_set = set(self.date_list) | new_dates
+                self.date_list = sorted(date_set, reverse=True)
+
+        except Exception as e:
+            logger.debug(f"元数据拉取异常 {cp}: {e}")
+
     async def _update_dates_from_remote(self):
         """从 GitHub 拉取样本数据提取日期列表并缓存"""
         github_proxy = self._resolve_github_proxy()
@@ -353,17 +464,59 @@ class EmojiKitchenPlugin(Star):
         async with self._semaphore:
             return await self._try_fetch_url(url)
 
+    async def _try_exact_date(self, cp1: str, cp2: str, date: str, cache_key: str) -> str | None:
+        """尝试精确日期的两个方向 URL"""
+        urls = self._build_urls(cp1, cp2, date)
+        tasks = [self._try_fetch_with_semaphore(url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            if r is not None:
+                try:
+                    return self._save_image_atomic(cache_key, r)
+                except OSError:
+                    return None
+        return None
+
     async def _fetch_emoji_image(self, cp1: str, cp2: str) -> str | None:
         """尝试从 CDN 获取合成图片，返回缓存路径或 None
 
-        策略：
-        1. 取日期列表前 max_probe_dates 个
-        2. 日期之间串行，同一日期内的 2 个 URL 并发
-        3. 首个命中立即返回，不继续探测后续日期
-        4. 遇 429（RateLimitError）立即停止所有探测
-        5. 用 semaphore 限制同时外呼量
+        策略（三阶段）：
+        1. 精确查找：从元数据索引获取确切日期，只请求该日期（2 个方向）
+        2. 按需拉取：索引未命中时，从 GitHub 拉取元数据并缓存，再次查找
+        3. 回退探测：仍未命中则走原有的日期探测逻辑
         """
         cache_key = make_cache_key(cp1, cp2)
+
+        # === 阶段1：精确查找 ===
+        date = self._lookup_date(cp1, cp2)
+        if date:
+            result = await self._try_exact_date(cp1, cp2, date, cache_key)
+            if result:
+                return result
+
+        # === 阶段2：按需拉取元数据 ===
+        # 检查是否需要拉取（本地没有缓存文件）
+        fetched_new = False
+        for cp in (cp1, cp2):
+            if not (self.metadata_dir / f"{cp}.json").exists():
+                await self._fetch_and_cache_metadata(cp)
+                fetched_new = True
+
+        if fetched_new:
+            date = self._lookup_date(cp1, cp2)
+            if date:
+                result = await self._try_exact_date(cp1, cp2, date, cache_key)
+                if result:
+                    return result
+
+        # === 阶段3：回退到日期探测 ===
+        return await self._probe_dates(cp1, cp2, cache_key)
+
+    async def _probe_dates(self, cp1: str, cp2: str, cache_key: str) -> str | None:
+        """回退：按日期列表逐日期探测（原有逻辑）"""
         max_probe = self._get_config("max_probe_dates", 10)
         probe_dates = self.date_list[:max_probe]
         if not probe_dates:
@@ -375,10 +528,7 @@ class EmojiKitchenPlugin(Star):
 
         for date in probe_dates:
             urls = self._build_urls(cp1, cp2, date)
-            tasks = []
-            for url in urls:
-                tasks.append(self._try_fetch_with_semaphore(url))
-
+            tasks = [self._try_fetch_with_semaphore(url) for url in urls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             found_data = None
