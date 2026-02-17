@@ -56,6 +56,29 @@ def make_cache_key(cp1: str, cp2: str) -> str:
     """生成排序后的缓存 key。保证 A+B 与 B+A 命中同一缓存。"""
     return "_".join(sorted([cp1, cp2]))
 
+def _parse_combinations(data: dict) -> dict[str, str]:
+    """从元数据 JSON 中解析组合索引。返回 {partner_cp: date}"""
+    index_entry = {}
+    combinations = data.get("combinations", {}) if isinstance(data, dict) else {}
+    for partner_cp, combo_list in combinations.items():
+        if not isinstance(combo_list, list) or not combo_list:
+            continue
+        chosen = None
+        for item in combo_list:
+            if not isinstance(item, dict):
+                continue
+            if item.get("isLatest"):
+                chosen = item
+                break
+        if chosen is None:
+            chosen = combo_list[0] if isinstance(combo_list[0], dict) else None
+        if chosen is None:
+            continue
+        date = chosen.get("date", "")
+        if date:
+            index_entry[partner_cp] = date
+    return index_entry
+
 # ===== 插件主类 =====
 @register("astrbot_plugin_emoji_kitchen", "monkeyray", "发送两个 emoji 自动合成 Google Emoji Kitchen 图片", "1.1.0")
 class EmojiKitchenPlugin(Star):
@@ -118,6 +141,14 @@ class EmojiKitchenPlugin(Star):
             return self.config[key]
         return default
 
+    def _get_config_int(self, key: str, default: int) -> int:
+        """从插件配置中获取整数值，类型异常时返回默认值"""
+        val = self._get_config(key, default)
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
     def _resolve_cdn_url(self) -> str:
         """解析实际的 CDN 地址：优先 cdn_source 预设，自定义时用 cdn_url"""
         source = str(self._get_config("cdn_source", "") or "")
@@ -174,7 +205,7 @@ class EmojiKitchenPlugin(Star):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             # 检查过期
-            expire_days = self._get_config("notfound_expire_days", 7)
+            expire_days = self._get_config_int("notfound_expire_days", 7)
             if time.time() - data.get("timestamp", 0) > expire_days * 86400:
                 path.unlink(missing_ok=True)
                 return False
@@ -203,13 +234,13 @@ class EmojiKitchenPlugin(Star):
             logger.warning(f"写入 notfound 标记失败: {e}")
 
     def _save_image_atomic(self, cache_key: str, data: bytes) -> str:
-        """原子写入缓存图片：先写临时文件再 rename"""
+        """原子写入缓存图片：先写临时文件再 replace"""
         target = self.cache_dir / f"{cache_key}.png"
         tmp_path = self.cache_dir / f"{cache_key}.tmp"
         try:
             with open(tmp_path, "wb") as f:
                 f.write(data)
-            os.rename(tmp_path, target)
+            os.replace(tmp_path, target)
             return str(target)
         except OSError as e:
             logger.warning(f"缓存写入失败: {e}")
@@ -258,25 +289,10 @@ class EmojiKitchenPlugin(Star):
                 cp = json_file.stem  # 文件名就是 emoji codepoint，如 "1f437"
                 with open(json_file, encoding="utf-8") as f:
                     data = json.load(f)
-                index_entry = {}
-                combinations = data.get("combinations", {})
-                for partner_cp, combo_list in combinations.items():
-                    if not isinstance(combo_list, list) or not combo_list:
-                        continue
-                    # 优先取 isLatest=true 的记录
-                    chosen = None
-                    for item in combo_list:
-                        if item.get("isLatest"):
-                            chosen = item
-                            break
-                    if chosen is None:
-                        chosen = combo_list[0]
-                    date = chosen.get("date", "")
-                    if date:
-                        index_entry[partner_cp] = date
+                index_entry = _parse_combinations(data)
                 if index_entry:
                     self.metadata_index[cp] = index_entry
-            except (json.JSONDecodeError, OSError, TypeError, KeyError) as e:
+            except (json.JSONDecodeError, OSError, TypeError, KeyError, AttributeError) as e:
                 logger.warning(f"加载元数据索引失败 {json_file.name}: {e}")
 
     def _lookup_date(self, cp1: str, cp2: str) -> str | None:
@@ -296,7 +312,7 @@ class EmojiKitchenPlugin(Star):
     async def _fetch_and_cache_metadata(self, cp: str):
         """从 GitHub 拉取单个 emoji 的元数据 JSON 并缓存，更新内存索引"""
         github_proxy = self._resolve_github_proxy()
-        timeout_sec = self._get_config("request_timeout", 10)
+        timeout_sec = self._get_config_int("request_timeout", 10)
         raw_url = f"https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/emoji/data/{cp}.json"
         if github_proxy:
             url = f"{github_proxy}/{raw_url}"
@@ -320,30 +336,19 @@ class EmojiKitchenPlugin(Star):
                 logger.warning(f"元数据缓存写入失败 {cp}: {e}")
 
             # 更新内存索引
-            index_entry = {}
-            combinations = data.get("combinations", {}) if isinstance(data, dict) else {}
-            for partner_cp, combo_list in combinations.items():
-                if not isinstance(combo_list, list) or not combo_list:
-                    continue
-                chosen = None
-                for item in combo_list:
-                    if item.get("isLatest"):
-                        chosen = item
-                        break
-                if chosen is None:
-                    chosen = combo_list[0]
-                date = chosen.get("date", "")
-                if date:
-                    index_entry[partner_cp] = date
+            index_entry = _parse_combinations(data)
             if index_entry:
                 self.metadata_index[cp] = index_entry
 
             # 从元数据中提取日期合并到日期列表
             new_dates = set()
+            combinations = data.get("combinations", {}) if isinstance(data, dict) else {}
             for partner_cp, combo_list in combinations.items():
                 if not isinstance(combo_list, list):
                     continue
                 for item in combo_list:
+                    if not isinstance(item, dict):
+                        continue
                     d = item.get("date", "")
                     if d and d not in self.date_list:
                         new_dates.add(d)
@@ -351,13 +356,13 @@ class EmojiKitchenPlugin(Star):
                 date_set = set(self.date_list) | new_dates
                 self.date_list = sorted(date_set, reverse=True)
 
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, OSError, KeyError, TypeError, AttributeError) as e:
             logger.debug(f"元数据拉取异常 {cp}: {e}")
 
     async def _update_dates_from_remote(self):
         """从 GitHub 拉取样本数据提取日期列表并缓存"""
         github_proxy = self._resolve_github_proxy()
-        timeout_sec = self._get_config("request_timeout", 10)
+        timeout_sec = self._get_config_int("request_timeout", 10)
         raw_url = "https://raw.githubusercontent.com/xsalazar/emoji-kitchen-backend/main/emoji/data/1f600.json"
         if github_proxy:
             url = f"{github_proxy}/{raw_url}"
@@ -376,9 +381,16 @@ class EmojiKitchenPlugin(Star):
             # 提取所有 date 字段
             remote_dates = set()
             if isinstance(data, dict):
-                for combo in data.get("combinations", []):
-                    if "date" in combo:
-                        remote_dates.add(combo["date"])
+                combinations = data.get("combinations", {})
+                if isinstance(combinations, dict):
+                    for partner_cp, combo_list in combinations.items():
+                        if isinstance(combo_list, list):
+                            for item in combo_list:
+                                if not isinstance(item, dict):
+                                    continue
+                                d = item.get("date", "")
+                                if d:
+                                    remote_dates.add(d)
 
             if remote_dates:
                 # 合并到已知列表并写入缓存
@@ -399,7 +411,7 @@ class EmojiKitchenPlugin(Star):
                 # 重新加载
                 self._load_date_list()
                 logger.info(f"日期列表更新成功，共 {len(self.date_list)} 个日期")
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, OSError, KeyError, TypeError, AttributeError) as e:
             logger.warning(f"远程日期更新失败: {e}")
 
     async def _get_lock(self, cache_key: str) -> asyncio.Lock:
@@ -408,10 +420,18 @@ class EmojiKitchenPlugin(Star):
             if cache_key in self._locks:
                 self._locks.move_to_end(cache_key)
                 return self._locks[cache_key]
+            # 先淘汰再插入，确保当前 key 不会被淘汰
+            while len(self._locks) >= self._MAX_LOCKS:
+                evicted = False
+                for key in list(self._locks.keys()):
+                    if not self._locks[key].locked():
+                        del self._locks[key]
+                        evicted = True
+                        break
+                if not evicted:
+                    break  # 所有锁都在使用中，允许临时超出上限
             lock = asyncio.Lock()
             self._locks[cache_key] = lock
-            while len(self._locks) > self._MAX_LOCKS:
-                self._locks.popitem(last=False)
             return lock
 
     def _build_urls(self, cp1: str, cp2: str, date: str) -> list[str]:
@@ -426,7 +446,7 @@ class EmojiKitchenPlugin(Star):
 
     async def _try_fetch_url(self, url: str) -> bytes | None:
         """尝试请求单个 URL。返回 None 仅表示确认 404，其他失败均 raise。"""
-        timeout_sec = self._get_config("request_timeout", 10)
+        timeout_sec = self._get_config_int("request_timeout", 10)
         try:
             session = await self._ensure_session()
 
@@ -465,20 +485,30 @@ class EmojiKitchenPlugin(Star):
             return await self._try_fetch_url(url)
 
     async def _try_exact_date(self, cp1: str, cp2: str, date: str, cache_key: str) -> str | None:
-        """尝试精确日期的两个方向 URL"""
+        """尝试精确日期的两个方向 URL，命中即返回"""
         urls = self._build_urls(cp1, cp2, date)
-        tasks = [self._try_fetch_with_semaphore(url) for url in urls]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            if r is not None:
+        tasks = [asyncio.ensure_future(self._try_fetch_with_semaphore(url)) for url in urls]
+        try:
+            for coro in asyncio.as_completed(tasks):
                 try:
-                    return self._save_image_atomic(cache_key, r)
-                except OSError:
-                    return None
-        return None
+                    result = await coro
+                except RateLimitError:
+                    raise  # 限流异常向上传播，停止后续探测
+                except Exception:
+                    continue
+                if result is not None:
+                    try:
+                        return self._save_image_atomic(cache_key, result)
+                    except OSError:
+                        return None
+            return None
+        finally:
+            # 取消剩余未完成的任务
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # 等待取消完成，避免警告
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _fetch_emoji_image(self, cp1: str, cp2: str) -> str | None:
         """尝试从 CDN 获取合成图片，返回缓存路径或 None
@@ -498,10 +528,21 @@ class EmojiKitchenPlugin(Star):
                 return result
 
         # === 阶段2：按需拉取元数据 ===
-        # 检查是否需要拉取（本地没有缓存文件）
+        # 检查是否需要拉取（本地没有缓存文件或文件过期）
         fetched_new = False
         for cp in (cp1, cp2):
-            if not (self.metadata_dir / f"{cp}.json").exists():
+            meta_file = self.metadata_dir / f"{cp}.json"
+            need_fetch = False
+            if not meta_file.exists():
+                need_fetch = True
+            else:
+                try:
+                    age = time.time() - meta_file.stat().st_mtime
+                    if age > 7 * 86400:  # 7 天过期
+                        need_fetch = True
+                except OSError:
+                    need_fetch = True
+            if need_fetch:
                 await self._fetch_and_cache_metadata(cp)
                 fetched_new = True
 
@@ -517,7 +558,7 @@ class EmojiKitchenPlugin(Star):
 
     async def _probe_dates(self, cp1: str, cp2: str, cache_key: str) -> str | None:
         """回退：按日期列表逐日期探测（原有逻辑）"""
-        max_probe = self._get_config("max_probe_dates", 10)
+        max_probe = self._get_config_int("max_probe_dates", 10)
         probe_dates = self.date_list[:max_probe]
         if not probe_dates:
             logger.warning("日期列表为空，无法探测")
@@ -616,8 +657,10 @@ class EmojiKitchenPlugin(Star):
                     yield event.image_result(path)
                     event.stop_event()
                     return
-            except Exception as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RateLimitError) as e:
                 logger.error(f"Emoji Kitchen 获取异常: {e}")
+            except Exception as e:
+                logger.exception(f"Emoji Kitchen 未预期异常: {e}")
 
         # 未命中：不 yield，不 stop_event，事件继续传播
 
