@@ -80,7 +80,7 @@ def _parse_combinations(data: dict) -> dict[str, str]:
     return index_entry
 
 # ===== 插件主类 =====
-@register("astrbot_plugin_emoji_kitchen", "monkeyray", "发送两个 emoji 自动合成 Google Emoji Kitchen 图片", "1.1.0")
+@register("astrbot_plugin_emoji_kitchen", "monkeyray", "发送两个 emoji 自动合成 Google Emoji Kitchen 图片", "1.1.1")
 class EmojiKitchenPlugin(Star):
     _MAX_LOCKS = 1024
     _CONCURRENT_LIMIT = 4
